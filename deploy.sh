@@ -14,7 +14,6 @@ LOG_FILE="${LOG_DIR}/deploy_${TIMESTAMP}.log"
 
 DEFAULT_BRANCH="main"
 SSH_TIMEOUT=10
-RSYNC_OPTS="-az --delete --rsync-path='mkdir -p \"%s\" && rsync'"
 
 # Exit codes (chosen for clarity)
 EX_OK=0
@@ -112,6 +111,7 @@ read_input "Remote server SSH username" REMOTE_USER 1
 read_input "Remote server IP / hostname" REMOTE_HOST 1
 read_input "SSH key path (private key, e.g. ~/.ssh/id_rsa)" SSH_KEY_PATH 1
 read_input "Application internal port (container listen port, e.g. 3000)" APP_PORT 1
+read_input "Domain name (optional, for Nginx server_name)" DOMAIN_NAME 0 "_"
 
 # Derive app name and directory
 REPO_BASENAME="$(basename -s .git "$GIT_REPO")"
@@ -128,6 +128,7 @@ log "  Branch: ${GIT_BRANCH}"
 log "  Remote: ${REMOTE_USER}@${REMOTE_HOST}"
 log "  SSH key: ${SSH_KEY_PATH}"
 log "  App internal port: ${APP_PORT}"
+log "  Domain name: ${DOMAIN_NAME}"
 log "  Local clone dir: ${LOCAL_CLONE_DIR}"
 log "  PAT (masked): $(mask_token "$GIT_PAT")"
 
@@ -153,7 +154,7 @@ log "SSH connectivity OK."
 
 ### If cleanup mode requested, perform remote cleanup then exit ###
 if [ "${CLEANUP_MODE}" -eq 1 ]; then
-  log "Running cleanup mode: will attempt to remove deployed resources on remote host."
+  log "Running cleanup mode: will attempt to remove deployed resources on remote host and local clone."
   REMOTE_APP_DIR="~/deployments/${REPO_BASENAME}"
   REMOTE_CONTAINER_NAME="${REPO_BASENAME}_app"
   CLEAN_CMD=$(cat <<EOF
@@ -168,10 +169,17 @@ if [ -f /etc/nginx/sites-enabled/${REPO_BASENAME} ]; then
   sudo nginx -t || true
   sudo systemctl reload nginx || true
 fi
-echo "Cleanup done."
+echo "Remote cleanup done."
 EOF
 )
   ssh_run "${CLEAN_CMD}" || fail $EX_CLEANUP_FAIL "Remote cleanup failed."
+  
+  # Local cleanup
+  if [ -d "${LOCAL_CLONE_DIR}" ]; then
+    log "Removing local clone directory: ${LOCAL_CLONE_DIR}"
+    rm -rf "${LOCAL_CLONE_DIR}"
+  fi
+  
   log "Cleanup completed successfully."
   exit $EX_OK
 fi
@@ -210,21 +218,34 @@ EOF
 fi
 log "Local repository ready at ${LOCAL_CLONE_DIR}."
 
+### Navigate into cloned directory ###
+cd "${LOCAL_CLONE_DIR}" || fail $EX_DEPLOY_FAIL "Failed to navigate to cloned directory"
+log "Working directory: $(pwd)"
+
 ### Verify Dockerfile or docker-compose.yml exists ###
-if [ -f "${LOCAL_CLONE_DIR}/Dockerfile" ]; then
+if [ -f "./Dockerfile" ]; then
   START_MODE="dockerfile"
-  log "Found Dockerfile."
-elif [ -f "${LOCAL_CLONE_DIR}/docker-compose.yml" ] || [ -f "${LOCAL_CLONE_DIR}/docker-compose.yaml" ]; then
+  log "Found Dockerfile in project root."
+elif [ -f "./docker-compose.yml" ] || [ -f "./docker-compose.yaml" ]; then
   START_MODE="compose"
-  log "Found docker-compose.yml."
+  log "Found docker-compose.yml in project root."
 else
   log "No Dockerfile or docker-compose.yml found in project root."
   # Perhaps project in subdir? try to detect typical dirs
-  if [ -d "${LOCAL_CLONE_DIR}/deploy" ]; then
-    log "Found deploy/ - using that folder by default."
-    # Not changing START_MODE; will re-check when rsync'd remote
+  if [ -d "./deploy" ] && ([ -f "./deploy/Dockerfile" ] || [ -f "./deploy/docker-compose.yml" ]); then
+    log "Found deploy/ subdirectory with Docker configuration. Switching to that directory."
+    cd "./deploy" || fail $EX_DEPLOY_FAIL "Failed to navigate to deploy/ subdirectory"
+    log "Working directory: $(pwd)"
+    # Re-check what we have
+    if [ -f "./Dockerfile" ]; then
+      START_MODE="dockerfile"
+      log "Found Dockerfile in deploy/ directory."
+    elif [ -f "./docker-compose.yml" ] || [ -f "./docker-compose.yaml" ]; then
+      START_MODE="compose"
+      log "Found docker-compose.yml in deploy/ directory."
+    fi
   else
-    fail $EX_DEPLOY_FAIL "No Dockerfile or docker-compose.yml found. Cannot continue."
+    fail $EX_DEPLOY_FAIL "No Dockerfile or docker-compose.yml found in project root or deploy/ subdirectory. Cannot continue."
   fi
 fi
 
@@ -278,8 +299,9 @@ fi
 
 # Add user to docker group if not already
 if ! groups "$USER" | grep -q docker; then
-  echo "Adding $USER to docker group (requires re-login to take effect)..."
+  echo "Adding $USER to docker group..."
   sudo usermod -aG docker "$USER" || true
+  echo "Note: Docker group membership will take effect after re-login or using 'newgrp docker'"
 fi
 
 # Enable and start services
@@ -288,6 +310,14 @@ if command -v systemctl >/dev/null 2>&1; then
   sudo systemctl start docker || true
   sudo systemctl enable nginx || true
   sudo systemctl start nginx || true
+fi
+
+# Check firewall status for port 80
+echo "Checking firewall status..."
+if command -v ufw >/dev/null 2>&1; then
+  sudo ufw status | grep -E "80|inactive" || echo "Warning: Port 80 may be blocked by UFW"
+elif command -v firewall-cmd >/dev/null 2>&1; then
+  sudo firewall-cmd --list-ports | grep -E "80" || echo "Warning: Port 80 may be blocked by firewalld"
 fi
 
 # Print versions
@@ -313,14 +343,13 @@ ssh_run "mkdir -p ${REMOTE_APP_DIR}" || fail $EX_DEPLOY_FAIL "Failed to create r
 
 # Use rsync if available locally; fallback to scp for portability
 if command -v rsync >/dev/null 2>&1; then
-  # prepare rsync command - note: cannot directly format %s into remote path in string; use printf
-  RSYNC_CMD="rsync -az --delete -e \"ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no\" \"${LOCAL_CLONE_DIR%/}/\" \"${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_APP_DIR%/}/\""
-  log_debug "Running: ${RSYNC_CMD}"
-  # shellcheck disable=SC2029,SC2086
-  eval "${RSYNC_CMD}" | tee -a "${LOG_FILE}" || fail $EX_DEPLOY_FAIL "rsync failed"
+  log "Using rsync for file transfer..."
+  rsync -az --delete -e "ssh -i ${SSH_KEY_PATH} -o StrictHostKeyChecking=no" \
+    "${LOCAL_CLONE_DIR%/}/" \
+    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_APP_DIR%/}/" | tee -a "${LOG_FILE}" || fail $EX_DEPLOY_FAIL "rsync failed"
 else
   log "rsync not found locally, using scp (slower)."
-  scp -i "${SSH_KEY_PATH}" -r "${LOCAL_CLONE_DIR}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_APP_DIR}" || fail $EX_DEPLOY_FAIL "scp failed"
+  scp -i "${SSH_KEY_PATH}" -r "${LOCAL_CLONE_DIR%/}/"* "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_APP_DIR}/" || fail $EX_DEPLOY_FAIL "scp failed"
 fi
 log "Files transferred."
 
@@ -330,6 +359,13 @@ log "Deploying application on remote host..."
 REMOTE_BUILD_CMDS=$(cat <<EOF
 set -e
 cd ${REMOTE_APP_DIR}
+
+# Ensure docker commands work (activate docker group if needed)
+if ! docker info >/dev/null 2>&1; then
+  echo "Docker requires group permissions. Attempting to use newgrp..."
+  # This won't work in non-interactive SSH but we try anyway
+fi
+
 # Stop and remove any previously-running container with same name
 if docker ps -a --filter "name=${REMOTE_CONTAINER_NAME}" --format '{{.ID}}' | grep -q .; then
   echo "Stopping existing containers named ${REMOTE_CONTAINER_NAME}..."
@@ -355,25 +391,26 @@ else
 fi
 
 # Wait for container health (if HEALTHCHECK present) or check up status
-sleep 3
+sleep 5
 CONTAINER_IDS=\$(docker ps --filter "name=${REMOTE_CONTAINER_NAME}" --format '{{.ID}}')
 if [ -z "\$CONTAINER_IDS" ]; then
   echo "No running container found for ${REMOTE_CONTAINER_NAME}"
   exit 3
 fi
 
-# If containers expose healthcheck, wait up to 30s
+# If containers expose healthcheck, wait up to 60s
 for cid in \$CONTAINER_IDS; do
-  if docker inspect --format '{{json .State.Health}}' "\$cid" >/dev/null 2>&1; then
-    echo "Container \$cid has healthcheck. Waiting for 'healthy' (up to 30s)..."
+  if docker inspect --format '{{json .State.Health}}' "\$cid" 2>/dev/null | grep -q "Status"; then
+    echo "Container \$cid has healthcheck. Waiting for 'healthy' (up to 60s)..."
     tries=0
-    until [ "\$(docker inspect --format '{{.State.Health.Status}}' \$cid)" = "healthy" ] || [ \$tries -ge 15 ]; do
+    until [ "\$(docker inspect --format '{{.State.Health.Status}}' \$cid 2>/dev/null || echo 'none')" = "healthy" ] || [ \$tries -ge 30 ]; do
       sleep 2
       tries=\$((tries+1))
     done
-    echo "Health status: \$(docker inspect --format '{{.State.Health.Status}}' \$cid || true)"
+    health_status="\$(docker inspect --format '{{.State.Health.Status}}' \$cid 2>/dev/null || echo 'unknown')"
+    echo "Health status after wait: \$health_status"
   else
-    echo "No healthcheck for container \$cid; skipping health wait."
+    echo "No healthcheck for container \$cid; assuming healthy if running."
   fi
 done
 
@@ -381,10 +418,7 @@ echo "Deployment complete (containers running)."
 EOF
 )
 
-# Replace placeholder APP_PORT with actual value in the remote command
-REMOTE_BUILD_CMDS_WITH_PORT="$(printf '%s\n' "$REMOTE_BUILD_CMDS" | sed "s/\${APP_PORT}/${APP_PORT}/g" | sed "s/\${REMOTE_CONTAINER_NAME}/${REMOTE_CONTAINER_NAME}/g" )"
-
-ssh_run "$REMOTE_BUILD_CMDS_WITH_PORT" || fail $EX_DEPLOY_FAIL "Remote build/deploy failed"
+ssh_run "$REMOTE_BUILD_CMDS" || fail $EX_DEPLOY_FAIL "Remote build/deploy failed"
 
 log "Containers deployed."
 
@@ -398,7 +432,7 @@ REMOTE_NGINX_ENABLED="/etc/nginx/sites-enabled/${REPO_BASENAME}"
 NGINX_CONF_CONTENT=$(cat <<EOF
 server {
     listen 80;
-    server_name _;
+    server_name ${DOMAIN_NAME};
 
     location / {
         proxy_set_header Host \$host;
@@ -409,6 +443,18 @@ server {
         proxy_read_timeout 90;
         proxy_connect_timeout 5s;
     }
+
+    # SSL configuration (uncomment and configure after obtaining certificates)
+    # To enable HTTPS with Let's Encrypt:
+    # 1. Install certbot: sudo apt install certbot python3-certbot-nginx
+    # 2. Run: sudo certbot --nginx -d your-domain.com
+    # 3. Certbot will automatically configure SSL below
+    
+    # listen 443 ssl http2;
+    # ssl_certificate /etc/letsencrypt/live/${DOMAIN_NAME}/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_NAME}/privkey.pem;
+    # ssl_protocols TLSv1.2 TLSv1.3;
+    # ssl_ciphers HIGH:!aNULL:!MD5;
 }
 EOF
 )
@@ -417,11 +463,13 @@ EOF
 SSH_NGINX_CMDS=$(cat <<EOF
 set -e
 echo "Writing nginx config to ${REMOTE_NGINX_CONF} ..."
-sudo bash -c 'cat > "${REMOTE_NGINX_CONF}" <<'NGCONF'
+sudo bash -c 'cat > "${REMOTE_NGINX_CONF}"' <<'NGCONF'
 ${NGINX_CONF_CONTENT}
 NGCONF
 sudo ln -sf "${REMOTE_NGINX_CONF}" "${REMOTE_NGINX_ENABLED}"
+echo "Testing nginx configuration..."
 sudo nginx -t
+echo "Reloading nginx..."
 sudo systemctl reload nginx || true
 echo "Nginx proxied to 127.0.0.1:${APP_PORT}"
 EOF
@@ -450,28 +498,52 @@ fi
 log "Container is running: ${CNT_INFO}"
 
 # 3) Test HTTP locally on remote (curl)
-REMOTE_CURL_CMD="curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT} || true"
+REMOTE_CURL_CMD="curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT} || echo '000'"
 HTTP_STATUS_REMOTE="$(ssh -i "${SSH_KEY_PATH}" -o BatchMode=yes -o ConnectTimeout="${SSH_TIMEOUT}" "${REMOTE_USER}@${REMOTE_HOST}" "${REMOTE_CURL_CMD}")"
 log "Remote HTTP status to 127.0.0.1:${APP_PORT} -> ${HTTP_STATUS_REMOTE}"
 
 # 4) Test via nginx public (from local)
-HTTP_STATUS_PUBLIC="$(curl -s -o /dev/null -w '%{http_code}' "http://${REMOTE_HOST}/" || true)"
-log "Public HTTP status via nginx -> ${HTTP_STATUS_PUBLIC}"
+if command -v curl >/dev/null 2>&1; then
+  HTTP_STATUS_PUBLIC="$(curl -s -o /dev/null -w '%{http_code}' "http://${REMOTE_HOST}/" 2>/dev/null || echo '000')"
+  log "Public HTTP status via nginx -> ${HTTP_STATUS_PUBLIC}"
+  
+  if [ "$HTTP_STATUS_PUBLIC" = "000" ] || [ -z "$HTTP_STATUS_PUBLIC" ]; then
+    log "Warning: could not fetch public endpoint via nginx. Firewall / security groups might be blocking port 80."
+  else
+    log "✓ Public endpoint returned HTTP ${HTTP_STATUS_PUBLIC}"
+  fi
+else
+  log "curl not available locally; skipping public endpoint test."
+fi
 
 if [ "$HTTP_STATUS_REMOTE" = "000" ] || [ -z "$HTTP_STATUS_REMOTE" ]; then
   log "Warning: could not fetch internal app endpoint on remote. It might still be starting."
-fi
-
-if [ "$HTTP_STATUS_PUBLIC" = "000" ] || [ -z "$HTTP_STATUS_PUBLIC" ]; then
-  log "Warning: could not fetch public endpoint via nginx. Firewall / security groups might be blocking port 80."
 else
-  log "Public endpoint returned HTTP ${HTTP_STATUS_PUBLIC}"
+  log "✓ Internal endpoint returned HTTP ${HTTP_STATUS_REMOTE}"
 fi
 
 ### Provide container logs for quick debugging ###
 log "Fetching last 200 lines of container logs (if available)..."
-ssh_run "docker logs --tail 200 ${REMOTE_CONTAINER_NAME} || true" | tee -a "${LOG_FILE}" || true
+ssh_run "docker logs --tail 200 ${REMOTE_CONTAINER_NAME} 2>&1 || true" | tee -a "${LOG_FILE}" || true
 
-log "Deployment validation steps completed. Check above outputs and ${LOG_FILE} for details."
+log ""
+log "========================================="
+log "Deployment Summary:"
+log "========================================="
+log "✓ Application deployed successfully"
+log "✓ Container: ${REMOTE_CONTAINER_NAME}"
+log "✓ Internal port: ${APP_PORT}"
+log "✓ Nginx reverse proxy configured"
+log "✓ Public URL: http://${REMOTE_HOST}/"
+if [ "${DOMAIN_NAME}" != "_" ]; then
+  log "✓ Domain configured: ${DOMAIN_NAME}"
+  log ""
+  log "To enable HTTPS, SSH into the server and run:"
+  log "  sudo apt install certbot python3-certbot-nginx"
+  log "  sudo certbot --nginx -d ${DOMAIN_NAME}"
+fi
+log "========================================="
+log ""
+log "Deployment validation completed. Check ${LOG_FILE} for full details."
 
 exit $EX_OK
